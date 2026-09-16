@@ -4,14 +4,14 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QGroupBox, QTabWidget,
     QVBoxLayout, QHBoxLayout, QFormLayout, QFileDialog, QMessageBox,
-    QScrollArea, QPlainTextEdit, QSizePolicy
+    QScrollArea, QSizePolicy
 )
 
 import numpy as np
 
 from global_threshold import global_threshold
 from otsu_threshold import otsu_threshold
-from adaptive_threshold import adaptive_threshold
+from adaptive_threshold import adaptive_threshold, adaptive_gaussian
 
 
 class ImageBox(QGroupBox):
@@ -43,6 +43,15 @@ class ImageBox(QGroupBox):
     def show_text(self, text):
         self.label.clear()
         self.label.setText(text)
+
+    def show_pixmap(self, pixmap):
+        self.label.setPixmap(
+            pixmap.scaled(
+                self.label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+        )
 
 
 class MainWindow(QMainWindow):
@@ -112,12 +121,6 @@ class MainWindow(QMainWindow):
                 background: white;
             }
 
-            QPlainTextEdit {
-                border: 1px solid #cfd4da;
-                border-radius: 5px;
-                background: white;
-                font-size: 14px;
-            }
 
             QTabBar::tab {
                 padding: 12px 25px;
@@ -130,7 +133,6 @@ class MainWindow(QMainWindow):
     # ==========================================================
 
     def setup_ui(self):
-
         central = QWidget()
         self.setCentralWidget(central)
 
@@ -148,12 +150,7 @@ class MainWindow(QMainWindow):
         root.addWidget(title)
 
         tabs = QTabWidget()
-
-        tabs.addTab(
-            self.create_threshold_tab(),
-            "Ngưỡng hóa ảnh"
-        )
-
+        tabs.addTab(self.create_threshold_tab(), "Ngưỡng hóa ảnh")
         root.addWidget(tabs)
 
     # ==========================================================
@@ -162,7 +159,6 @@ class MainWindow(QMainWindow):
 
     def create_file_buttons(self, open_image_slot, open_video_slot,
                             save_slot, process_slot):
-
         box = QGroupBox("Tệp và xử lý")
         layout = QHBoxLayout()
 
@@ -183,7 +179,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(btn_save)
 
         box.setLayout(layout)
-
         return box
 
     # ==========================================================
@@ -191,10 +186,8 @@ class MainWindow(QMainWindow):
     # ==========================================================
 
     def create_threshold_tab(self):
-
         page = QWidget()
 
-        # Scroll để có con trỏ kéo lên/xuống
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
@@ -203,22 +196,13 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         layout.setSpacing(10)
 
-        # -------------------------------
-        # FILE
-        # -------------------------------
-
         file_box = self.create_file_buttons(
             self.open_threshold_image,
             self.open_threshold_video,
             self.save_threshold,
             self.run_threshold
         )
-
         layout.addWidget(file_box)
-
-        # -------------------------------
-        # ẢNH
-        # -------------------------------
 
         images = QHBoxLayout()
 
@@ -227,7 +211,6 @@ class MainWindow(QMainWindow):
 
         images.addWidget(self.threshold_original, 1)
         images.addWidget(self.threshold_result, 1)
-
         layout.addLayout(images)
 
         # -------------------------------
@@ -245,95 +228,61 @@ class MainWindow(QMainWindow):
             "Otsu",
             "Adaptive Threshold"
         ])
-
         self.threshold_method.currentIndexChanged.connect(
             self.update_threshold_parameters
         )
 
-        algorithm_layout.addWidget(
-            QLabel("Chọn phương pháp:")
-        )
-        algorithm_layout.addWidget(
-            self.threshold_method
-        )
+        algorithm_layout.addWidget(QLabel("Chọn phương pháp:"))
+        algorithm_layout.addWidget(self.threshold_method)
         algorithm_layout.addStretch()
-
         algorithm_box.setLayout(algorithm_layout)
 
-        # Parameters
-        self.threshold_parameter_box = QGroupBox(
-            "Tham số"
-        )
-
+        self.threshold_parameter_box = QGroupBox("Tham số")
         parameter_layout = QFormLayout()
 
+        self.global_threshold_label = QLabel("Threshold:")
         self.global_threshold = QSpinBox()
         self.global_threshold.setRange(0, 255)
         self.global_threshold.setValue(128)
 
+        self.adaptive_method_label = QLabel("Phương pháp:")
+        self.adaptive_method = QComboBox()
+        self.adaptive_method.addItems(["Mean", "Gaussian"])
+
+        self.block_size_label = QLabel("Block Size:")
         self.block_size = QSpinBox()
         self.block_size.setRange(3, 99)
         self.block_size.setSingleStep(2)
         self.block_size.setValue(11)
 
+        self.c_value_label = QLabel("C:")
         self.c_value = QDoubleSpinBox()
         self.c_value.setRange(-100, 100)
+        self.c_value.setDecimals(2)
         self.c_value.setValue(2)
 
         parameter_layout.addRow(
-            "Threshold:",
+            self.global_threshold_label,
             self.global_threshold
         )
-
         parameter_layout.addRow(
-            "Block Size:",
+            self.adaptive_method_label,
+            self.adaptive_method
+        )
+        parameter_layout.addRow(
+            self.block_size_label,
             self.block_size
         )
-
         parameter_layout.addRow(
-            "C:",
+            self.c_value_label,
             self.c_value
         )
 
-        self.threshold_parameter_box.setLayout(
-            parameter_layout
-        )
+        self.threshold_parameter_box.setLayout(parameter_layout)
 
         setting_row.addWidget(algorithm_box, 1)
-        setting_row.addWidget(
-            self.threshold_parameter_box, 2
-        )
-
+        setting_row.addWidget(self.threshold_parameter_box, 2)
         layout.addLayout(setting_row)
-
-        # -------------------------------
-        # ĐÁNH GIÁ
-        # -------------------------------
-
-        evaluation_box = QGroupBox(
-            "Đánh giá kết quả"
-        )
-
-        evaluation_layout = QVBoxLayout()
-
-        self.threshold_comment = QPlainTextEdit()
-        self.threshold_comment.setPlaceholderText(
-            "Nhập nhận xét về kết quả xử lý..."
-        )
-        self.threshold_comment.setMinimumHeight(100)
-
-        evaluation_layout.addWidget(
-            QLabel("Nhận xét:")
-        )
-        evaluation_layout.addWidget(
-            self.threshold_comment
-        )
-
-        evaluation_box.setLayout(
-            evaluation_layout
-        )
-
-        layout.addWidget(evaluation_box)
 
         layout.addStretch()
 
@@ -344,7 +293,6 @@ class MainWindow(QMainWindow):
         page_layout.addWidget(scroll)
 
         self.update_threshold_parameters()
-
         return page
 
     # ==========================================================
@@ -352,62 +300,29 @@ class MainWindow(QMainWindow):
     # ==========================================================
 
     def update_threshold_parameters(self):
-
         method = self.threshold_method.currentText()
 
-        if method == "Global Threshold":
-            self.global_threshold.setVisible(True)
-            self.block_size.setVisible(False)
-            self.c_value.setVisible(False)
+        is_global = method == "Global Threshold"
+        is_otsu = method == "Otsu"
+        is_adaptive = method == "Adaptive Threshold"
 
-            self.threshold_parameter_box.layout().labelForField(
-                self.global_threshold
-            ).setVisible(True)
+        self.global_threshold_label.setVisible(is_global)
+        self.global_threshold.setVisible(is_global)
 
-        elif method == "Otsu":
-            self.global_threshold.setVisible(False)
-            self.block_size.setVisible(False)
-            self.c_value.setVisible(False)
+        self.adaptive_method_label.setVisible(is_adaptive)
+        self.adaptive_method.setVisible(is_adaptive)
 
-        elif method == "Adaptive Threshold":
-            self.global_threshold.setVisible(False)
-            self.block_size.setVisible(True)
-            self.c_value.setVisible(True)
+        self.block_size_label.setVisible(is_adaptive)
+        self.block_size.setVisible(is_adaptive)
 
-        # Cập nhật lại label theo widget đang hiển thị
-        self.refresh_parameter_labels(
-            self.threshold_parameter_box
-        )
-
-    def refresh_parameter_labels(self, group):
-        layout = group.layout()
-
-        for i in range(layout.rowCount()):
-            label_item = layout.itemAt(
-                i, QFormLayout.LabelRole
-            )
-
-            field_item = layout.itemAt(
-                i, QFormLayout.FieldRole
-            )
-
-            if label_item and field_item:
-                widget = field_item.widget()
-
-                if widget:
-                    visible = widget.isVisible()
-
-                    label = label_item.widget()
-
-                    if label:
-                        label.setVisible(visible)
+        self.c_value_label.setVisible(is_adaptive)
+        self.c_value.setVisible(is_adaptive)
 
     # ==========================================================
     # MỞ ẢNH
     # ==========================================================
 
     def open_threshold_image(self):
-
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Chọn ảnh",
@@ -418,8 +333,6 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        self.original_image = path
-
         pixmap = QPixmap(path)
         if pixmap.isNull():
             QMessageBox.warning(
@@ -429,20 +342,18 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.threshold_original.label.setPixmap(
-            pixmap.scaled(
-                self.threshold_original.label.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-        )
+        self.original_image = path
+        self.original_video = None
+        self.result = None
+
+        self.threshold_original.show_pixmap(pixmap)
+        self.threshold_result.show_text("Chưa có ảnh")
 
     # ==========================================================
     # MỞ VIDEO
     # ==========================================================
 
     def open_threshold_video(self):
-
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Chọn video",
@@ -453,16 +364,20 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
+        self.original_video = path
+        self.original_image = None
+        self.result = None
+
         self.threshold_original.show_text(
             f"VIDEO ĐÃ CHỌN\n\n{path}"
         )
+        self.threshold_result.show_text("Chưa xử lý video")
 
-        self.original_video = path
-
+    # ==========================================================
     # CHẠY XỬ LÝ
+    # ==========================================================
 
     def run_threshold(self):
-
         if not self.original_image:
             QMessageBox.warning(
                 self,
@@ -472,15 +387,12 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # Đọc ảnh bằng QImage rồi chuyển sang ảnh xám NumPy.
             image = QImage(self.original_image)
 
             if image.isNull():
                 raise ValueError("Không thể đọc ảnh.")
 
-            image = image.convertToFormat(
-                QImage.Format_Grayscale8
-            )
+            image = image.convertToFormat(QImage.Format_Grayscale8)
 
             width = image.width()
             height = image.height()
@@ -493,34 +405,42 @@ class MainWindow(QMainWindow):
             ).reshape((height, width))
 
             method = self.threshold_method.currentText()
+            threshold = None
 
             if method == "Global Threshold":
                 threshold = self.global_threshold.value()
-                result = global_threshold(
-                    img_gray,
-                    threshold
-                )
+                result = global_threshold(img_gray, threshold)
 
             elif method == "Otsu":
                 threshold = otsu_threshold(img_gray)
-                result = global_threshold(
-                    img_gray,
-                    threshold
-                )
+                result = global_threshold(img_gray, threshold)
 
             elif method == "Adaptive Threshold":
-                result = adaptive_threshold(
-                    img_gray,
-                    self.block_size.value(),
-                    self.c_value.value()
-                )
+                adaptive_method = self.adaptive_method.currentText()
+                block_size = self.block_size.value()
+                c_value = self.c_value.value()
+
+                if adaptive_method == "Mean":
+                    result = adaptive_threshold(
+                        img_gray,
+                        block_size,
+                        c_value
+                    )
+                else:
+                    result = adaptive_gaussian(
+                        img_gray,
+                        block_size,
+                        c_value
+                    )
 
             else:
-                raise ValueError(
-                    "Phương pháp xử lý không hợp lệ."
-                )
+                raise ValueError("Phương pháp xử lý không hợp lệ.")
 
-            # Chuyển kết quả NumPy về QImage để hiển thị.
+            # Đảm bảo kết quả là ma trận uint8 2D
+            result = np.asarray(result, dtype=np.uint8)
+            if result.shape != (height, width):
+                raise ValueError("Kích thước ảnh kết quả không hợp lệ.")
+
             result_image = QImage(
                 result.data,
                 width,
@@ -530,25 +450,8 @@ class MainWindow(QMainWindow):
             ).copy()
 
             pixmap = QPixmap.fromImage(result_image)
-
-            self.threshold_result.label.setPixmap(
-                pixmap.scaled(
-                    self.threshold_result.label.size(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-            )
-
-            if method == "Otsu":
-                self.threshold_comment.setPlainText(
-                    f"Otsu tự động chọn ngưỡng = {threshold}"
-                )
-            else:
-                self.threshold_comment.setPlainText(
-                    f"Đã xử lý bằng phương pháp: {method}"
-                )
-
-            self.result = result
+            self.threshold_result.show_pixmap(pixmap)
+            self.result = result.copy()
 
         except Exception as e:
             QMessageBox.critical(
@@ -557,21 +460,57 @@ class MainWindow(QMainWindow):
                 f"Không thể xử lý ảnh:\n{e}"
             )
 
+    # ==========================================================
     # LƯU KẾT QUẢ
+    # ==========================================================
 
     def save_threshold(self):
+        if self.result is None:
+            QMessageBox.warning(
+                self,
+                "Thông báo",
+                "Chưa có kết quả để lưu. Vui lòng xử lý ảnh trước."
+            )
+            return
 
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Lưu kết quả",
             "",
             "PNG (*.png);;JPG (*.jpg)"
         )
 
-        if path:
+        if not path:
+            return
+
+        # Nếu người dùng chưa nhập phần mở rộng, tự thêm theo bộ lọc
+        if "." not in path.split("/")[-1]:
+            if "JPG" in selected_filter:
+                path += ".jpg"
+            else:
+                path += ".png"
+
+        try:
+            saved = QImage(
+                self.result.data,
+                self.result.shape[1],
+                self.result.shape[0],
+                self.result.shape[1],
+                QImage.Format_Grayscale8
+            ).copy().save(path)
+
+            if not saved:
+                raise IOError("Không thể ghi file kết quả.")
+
             QMessageBox.information(
                 self,
                 "Lưu kết quả",
-                "Đã chọn vị trí lưu kết quả."
+                f"Đã lưu kết quả tại:\n{path}"
             )
 
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Lỗi lưu kết quả",
+                f"Không thể lưu ảnh:\n{e}"
+            )
