@@ -1,422 +1,799 @@
+import os
+import shutil
+import tempfile
+import time
+
+import cv2
+import numpy as np
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QPixmap, QImage, QFont
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QLabel, QPushButton, QComboBox, QSpinBox,
+    QGroupBox, QVBoxLayout, QHBoxLayout, QFormLayout, QFileDialog,
+    QMessageBox, QScrollArea, QSizePolicy
+)
+
 from algorithms.detect_edges import edges
 from algorithms.contour import contour_detect
 from algorithms.bounding_box import detect_bounding_boxes
 
-import cv2
-import numpy as np
-from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QComboBox, QSpinBox, QFileDialog,
-    QGroupBox, QFormLayout, QCheckBox, QSizePolicy
-)
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap
+
+class ImageBox(QGroupBox):
+    def __init__(self, title):
+        super().__init__(title)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 22, 14, 14)
+        self. _current_pixmap = None
+
+        self.label = QLabel("Chưa có ảnh\nNhấn 'Mở ảnh' để bắt đầu")
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setMinimumSize(420, 330)
+        # Dùng Ignored để QLabel co giãn mượt cả khi phóng to lẫn thu nhỏ cửa sổ
+        self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.label.setStyleSheet(
+            "QLabel { border: 2px dashed #CBD5E1; border-radius: 12px; "
+            "background: #F8FAFC; color: #94A3B8; font-size: 15px; }"
+        )
+        layout.addWidget(self.label)
+
+    def show_text(self, text):
+        self._current_pixmap = None
+        self.label.setPixmap(QPixmap())
+        self.label.setText(text)
+
+    def show_pixmap(self, pixmap):
+        self._current_pixmap = pixmap
+        self.label.setText("")
+        self._update_scaled_pixmap()
+
+    def _update_scaled_pixmap(self):
+        if self._current_pixmap is not None and not self._current_pixmap.isNull():
+            self.label.setPixmap(
+                self._current_pixmap.scaled(
+                    self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_scaled_pixmap()
+
+
+class VideoWorker(QThread):
+    # Phát tín hiệu từng frame: (frame_goc, frame_ket_qua, stats, so_frame_hien_tai, tong_so_frame)
+    frame_ready = Signal(object, object, object, int, int)
+    finished_ok = Signal(str, object, object, int)
+    failed = Signal(str)
+
+    def __init__(self, video_path, get_params_fn):
+        super().__init__()
+        self.video_path = video_path
+        self.get_params_fn = get_params_fn
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def _process_single_frame(self, frame):
+        params = self.get_params_fn()
+        method = params["method"]
+
+        if method.startswith("Edge"):
+            return edges(frame, params["low"], params["high"])
+
+        if method == "Contour":
+            bk = params["blur_k"]
+            if bk % 2 == 0:
+                bk += 1
+            return contour_detect(
+                frame,
+                blur_k=bk,
+                thresh=params["threshold"],
+                morph_k=params["morph_k"],
+                min_erea=params["min_area"],
+            )
+
+        return detect_bounding_boxes(
+            frame, params["threshold"], params["min_area"]
+        )
+
+    def run(self):
+        cap = None
+        writer = None
+        output_path = None
+        try:
+            cap = cv2.VideoCapture(self.video_path)
+            if not cap.isOpened():
+                raise ValueError("Không thể mở tệp video.")
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if not fps or fps <= 0 or np.isnan(fps):
+                fps = 25.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            frame_delay_ms = max(1, int(1000.0 / fps))
+
+            last_result = None
+            last_stats = None
+            frame_count = 0
+
+            while not self._stop:
+                t_start = time.perf_counter()
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+
+                # Khởi tạo VideoWriter theo đúng kích thước thực tế của frame đầu tiên
+                if writer is None:
+                    h, w = frame.shape[:2]
+                    fd, output_path = tempfile.mkstemp(suffix=".mp4")
+                    os.close(fd)
+                    writer = cv2.VideoWriter(
+                        output_path,
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        fps,
+                        (w, h),
+                    )
+
+                result, stats = self._process_single_frame(frame)
+
+                # Đảm bảo ảnh ghi vào VideoWriter luôn có 3 kênh màu (BGR) và đúng kích thước
+                if result.ndim == 2:
+                    result_bgr = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+                else:
+                    result_bgr = result
+                if result_bgr.shape[:2] != frame.shape[:2]:
+                    result_bgr = cv2.resize(
+                        result_bgr, (frame.shape[1], frame.shape[0])
+                    )
+
+                writer.write(result_bgr)
+                frame_count += 1
+                last_result = result.copy()
+                last_stats = stats
+
+                # Gửi frame về giao diện để hiển thị video chạy trực tiếp
+                self.frame_ready.emit(
+                    frame.copy(), last_result, stats, frame_count, total_frames
+                )
+
+                # Giữ nhịp phát video theo đúng FPS thực tế
+                elapsed_ms = int((time.perf_counter() - t_start) * 1000)
+                sleep_ms = frame_delay_ms - elapsed_ms
+                if sleep_ms > 0:
+                    self.msleep(sleep_ms)
+
+            if frame_count == 0:
+                raise ValueError("Video không có khung hình hợp lệ.")
+
+            # Đóng writer trước khi gửi đường dẫn file kết quả
+            if writer is not None:
+                writer.release()
+                writer = None
+
+            path_to_send = output_path
+            output_path = None
+            self.finished_ok.emit(
+                path_to_send, last_result, last_stats, frame_count
+            )
+        except Exception as e:
+            self.failed.emit(str(e))
+        finally:
+            if cap is not None:
+                cap.release()
+            if writer is not None:
+                writer.release()
+            if output_path and os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Chủ đề 5: Project 2 - Phát hiện lỗi bề mặt")
-        self.resize(1180, 680)
-        self.setup_stylesheet()
+        self.resize(1280, 900)
+        self.original_image = None
+        self.original_image_path = None
+        self.original_video = None
+        self.result = None
+        self.video_result_path = None
+        self.video_worker = None
+        self.last_processed_suffix = None
+        self._current_params = {}
+        self.setup_style()
+        self.setup_ui()
 
-        self.current_image = None
-        self.last_result_image = None
-        self.video_cap = None
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.process_video_frame)
-        self.is_video_playing = False
-
-        self.init_ui()
-
-    def setup_stylesheet(self):
+    def setup_style(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #1e1e2e; }
-            QWidget {
-                color: #cdd6f4;
-                font-family: 'Segoe UI', Arial, sans-serif;
-                font-size: 13px;
-            }
+            QMainWindow { background: #EEF2F7; }
+            QWidget { font-family: 'Segoe UI', Arial, sans-serif; }
+
             QGroupBox {
-                border: 1px solid #45475a;
-                border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 12px;
-                font-weight: bold;
-                color: #89b4fa;
+                background: white;
+                border: 1px solid #E2E8F0;
+                border-radius: 12px;
+                margin-top: 18px;
+                padding: 18px 14px 14px 14px;
+                font-size: 13px;
+                font-weight: 600;
+                color: #1E293B;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 5px;
+                subcontrol-position: top left;
+                left: 14px;
+                padding: 0 8px;
+                color: #4F46E5;
             }
+
+            QLabel { font-size: 14px; color: #334155; background: transparent; }
+
             QPushButton {
-                background-color: #313244;
-                border: 1px solid #45475a;
-                border-radius: 6px;
-                padding: 8px 14px;
-                font-weight: 600;
+                min-height: 40px;
+                padding: 6px 20px;
+                border-radius: 8px;
+                font-size: 14px;
+                background: white;
+                border: 1px solid #CBD5E1;
+                color: #334155;
             }
-            QPushButton:hover {
-                background-color: #45475a;
-                border-color: #89b4fa;
+            QPushButton:hover { background: #F1F5F9; border-color: #94A3B8; }
+            QPushButton:pressed { background: #E2E8F0; }
+            QPushButton:disabled { background: #F1F5F9; color: #94A3B8; }
+
+            QPushButton#primaryButton {
+                background: #4F46E5;
+                color: white;
+                border: 1px solid #4F46E5;
             }
-            QPushButton#primaryBtn {
-                background-color: #89b4fa;
-                color: #11111b;
-                border: none;
+            QPushButton#primaryButton:hover { background: #4338CA; border-color: #4338CA; }
+            QPushButton#primaryButton:disabled {
+                background: #A5B4FC; border-color: #A5B4FC; color: white;
             }
-            QPushButton#primaryBtn:hover { background-color: #b4befe; }
+
+            QPushButton#dangerButton {
+                background: #EF4444;
+                color: white;
+                border: 1px solid #EF4444;
+            }
+            QPushButton#dangerButton:hover { background: #DC2626; border-color: #DC2626; }
+
+            QPushButton#successButton {
+                background: #10B981;
+                color: white;
+                border: 1px solid #10B981;
+            }
+            QPushButton#successButton:hover { background: #059669; border-color: #059669; }
+
             QComboBox, QSpinBox {
-                background-color: #313244;
-                border: 1px solid #45475a;
-                border-radius: 5px;
-                padding: 5px 8px;
-                color: #cdd6f4;
+                min-height: 36px;
+                font-size: 14px;
+                padding: 0 12px;
+                border: 1px solid #CBD5E1;
+                border-radius: 8px;
+                background: white;
+                color: #1E293B;
             }
-            QLabel#imageBox {
-                background-color: #181825;
-                border: 2px dashed #45475a;
-                border-radius: 10px;
-                color: #6c7086;
-                font-size: 15px;
+            QComboBox:hover, QSpinBox:hover { border-color: #94A3B8; }
+            QComboBox:focus, QSpinBox:focus { border-color: #4F46E5; }
+            QComboBox QAbstractItemView {
+                background: white;
+                border: 1px solid #E2E8F0;
+                selection-background-color: #EEF2FF;
+                selection-color: #4F46E5;
+                padding: 4px;
             }
-            QLabel#infoBadge {
-                background-color: #313244;
-                border-radius: 6px;
-                padding: 8px;
-                color: #a6e3a1;
-                font-weight: bold;
-                font-size: 13px;
+
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: #E2E8F0; width: 10px; border-radius: 5px;
             }
+            QScrollBar::handle:vertical {
+                background: #CBD5E1; border-radius: 5px; min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover { background: #94A3B8; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         """)
 
-    def init_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(16)
+    def setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(22, 16, 22, 16)
+        root.setSpacing(6)
 
-        # CỘT TRÁI
-        sidebar = QWidget()
-        sidebar.setFixedWidth(310)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(12)
+        title = QLabel("PROJECT 2: PHÁT HIỆN LỖI BỀ MẶT")
+        title.setAlignment(Qt.AlignCenter)
+        f = QFont()
+        f.setPointSize(22)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #1E293B; padding: 6px 0;")
+        root.addWidget(title)
 
-        input_group = QGroupBox("1. Nguồn dữ liệu")
-        input_layout = QVBoxLayout()
-        self.btn_load_img = QPushButton("Tải Ảnh lên")
-        self.btn_load_vid = QPushButton("Tải Video lên")
-        self.btn_pause_vid = QPushButton("Tạm dừng Video")
-        self.btn_pause_vid.setVisible(False)
+        subtitle = QLabel("NHÓM 12")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet("color: #64748B; font-size: 14px;")
+        root.addWidget(subtitle)
 
-        self.btn_load_img.clicked.connect(self.load_image)
-        self.btn_load_vid.clicked.connect(self.load_video)
-        self.btn_pause_vid.clicked.connect(self.toggle_video)
+        root.addWidget(self.create_detection_tab(), 1)
 
-        input_layout.addWidget(self.btn_load_img)
-        input_layout.addWidget(self.btn_load_vid)
-        input_layout.addWidget(self.btn_pause_vid)
-        input_group.setLayout(input_layout)
+    def create_file_buttons(self):
+        box = QGroupBox("Tệp và xử lý")
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(16, 24, 16, 16)
+        layout.setSpacing(10)
 
-        algo_group = QGroupBox("2. Chức năng xử lý")
-        algo_layout = QVBoxLayout()
-        self.combo_algo = QComboBox()
-        self.combo_algo.addItems([
-            "Khoanh vùng lỗi (Bounding Box)",
-            "Phát hiện đường viền (Contour)",
-            "Phát hiện biên Canny (Detect Edges)"
-        ])
-        self.combo_algo.currentIndexChanged.connect(self.on_algo_changed)
-        algo_layout.addWidget(self.combo_algo)
-        algo_group.setLayout(algo_layout)
+        self.btn_image = QPushButton("Mở ảnh")
+        self.btn_video = QPushButton("Mở video")
+        self.process_btn = QPushButton("▶  Chạy xử lý")
+        self.save_btn = QPushButton("Lưu kết quả")
+        self.process_btn.setObjectName("primaryButton")
+        self.save_btn.setObjectName("successButton")
 
-        self.param_group = QGroupBox("3. Tham số thuật toán")
-        self.param_layout = QFormLayout()
-        self.param_layout.setLabelAlignment(Qt.AlignLeft)
+        self.btn_image.clicked.connect(self.open_image)
+        self.btn_video.clicked.connect(self.open_video)
+        self.process_btn.clicked.connect(self.run_detection)
+        self.save_btn.clicked.connect(self.save_result)
 
-        self.lbl_thresh = QLabel("Threshold (0-255):")
-        self.spin_thresh = QSpinBox()
-        self.spin_thresh.setRange(0, 255)
-        self.spin_thresh.setValue(100)
-        self.spin_thresh.valueChanged.connect(self.trigger_update)
+        layout.addWidget(self.btn_image)
+        layout.addWidget(self.btn_video)
+        layout.addStretch()
+        layout.addWidget(self.process_btn)
+        layout.addWidget(self.save_btn)
+        return box
 
-        self.lbl_min_area = QLabel("Diện tích tối thiểu (Min Area):")
-        self.spin_min_area = QSpinBox()
-        self.spin_min_area.setRange(1, 100000)
-        self.spin_min_area.setSingleStep(10)
-        self.spin_min_area.setValue(30)
-        self.spin_min_area.valueChanged.connect(self.trigger_update)
+    def create_detection_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
 
-        self.chk_show_binary = QCheckBox("Xem ảnh nhị phân (Binary Mask)")
-        self.chk_show_binary.stateChanged.connect(self.trigger_update)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        self.lbl_blur_k = QLabel("Blur Kernel (Số lẻ):")
-        self.spin_blur_k = QSpinBox()
-        self.spin_blur_k.setRange(1, 51)
-        self.spin_blur_k.setSingleStep(2)
-        self.spin_blur_k.setValue(5)
-        self.spin_blur_k.valueChanged.connect(self.on_odd_spin_changed)
+        layout.addWidget(self.create_file_buttons())
 
-        self.lbl_morph_k = QLabel("Morphology Kernel:")
-        self.spin_morph_k = QSpinBox()
-        self.spin_morph_k.setRange(1, 31)
-        self.spin_morph_k.setValue(3)
-        self.spin_morph_k.valueChanged.connect(self.trigger_update)
+        images = QHBoxLayout()
+        images.setSpacing(12)
+        self.original_box = ImageBox("ẢNH / VIDEO GỐC")
+        self.result_box = ImageBox("KẾT QUẢ SAU KHI PHÁT HIỆN LỖI")
+        images.addWidget(self.original_box, 1)
+        images.addWidget(self.result_box, 1)
+        layout.addLayout(images)
 
-        self.lbl_low_thresh = QLabel("Low Threshold:")
-        self.spin_low_thresh = QSpinBox()
-        self.spin_low_thresh.setRange(0, 254)
-        self.spin_low_thresh.setValue(80)
-        self.spin_low_thresh.valueChanged.connect(self.trigger_update)
+        settings = QHBoxLayout()
+        settings.setSpacing(12)
 
-        self.lbl_high_thresh = QLabel("High Threshold:")
-        self.spin_high_thresh = QSpinBox()
-        self.spin_high_thresh.setRange(1, 255)
-        self.spin_high_thresh.setValue(160)
-        self.spin_high_thresh.valueChanged.connect(self.trigger_update)
+        method_box = QGroupBox("Phương pháp phát hiện")
+        method_layout = QVBoxLayout(method_box)
+        method_layout.setContentsMargins(16, 24, 16, 16)
+        method_layout.setSpacing(8)
+        self.method = QComboBox()
+        self.method.addItems(["Edge (Canny)", "Contour", "Bounding Box"])
+        self.method.currentIndexChanged.connect(self.update_parameters)
+        method_layout.addWidget(QLabel("Chọn kỹ thuật:"))
+        method_layout.addWidget(self.method)
+        method_layout.addStretch()
 
-        self.param_layout.addRow(self.lbl_blur_k, self.spin_blur_k)
-        self.param_layout.addRow(self.lbl_thresh, self.spin_thresh)
-        self.param_layout.addRow(self.lbl_morph_k, self.spin_morph_k)
-        self.param_layout.addRow(self.lbl_min_area, self.spin_min_area)
-        self.param_layout.addRow(self.chk_show_binary)
-        self.param_layout.addRow(self.lbl_low_thresh, self.spin_low_thresh)
-        self.param_layout.addRow(self.lbl_high_thresh, self.spin_high_thresh)
-        self.param_group.setLayout(self.param_layout)
+        self.parameter_box = QGroupBox("Tham số điều chỉnh")
+        form = QFormLayout(self.parameter_box)
+        form.setContentsMargins(16, 24, 16, 16)
+        form.setSpacing(10)
 
-        info_group = QGroupBox("4. Thống kê kết quả")
-        info_layout = QVBoxLayout()
-        self.lbl_info = QLabel("Chưa có dữ liệu xử lý")
-        self.lbl_info.setObjectName("infoBadge")
-        self.lbl_info.setAlignment(Qt.AlignCenter)
-        self.lbl_info.setWordWrap(True)
+        self.low_label = QLabel("Ngưỡng thấp (Low):")
+        self.low = QSpinBox()
+        self.low.setRange(0, 255)
+        self.low.setValue(50)
 
-        self.btn_refresh = QPushButton("Cập nhật kết quả")
-        self.btn_refresh.setObjectName("primaryBtn")
-        self.btn_refresh.clicked.connect(self.update_image_result)
+        self.high_label = QLabel("Ngưỡng cao (High):")
+        self.high = QSpinBox()
+        self.high.setRange(0, 255)
+        self.high.setValue(150)
 
-        info_layout.addWidget(self.lbl_info)
-        info_layout.addWidget(self.btn_refresh)
-        info_group.setLayout(info_layout)
+        self.threshold_label = QLabel("Ngưỡng nhị phân:")
+        self.threshold = QSpinBox()
+        self.threshold.setRange(0, 255)
+        self.threshold.setValue(100)
 
-        sidebar_layout.addWidget(input_group)
-        sidebar_layout.addWidget(algo_group)
-        sidebar_layout.addWidget(self.param_group)
-        sidebar_layout.addWidget(info_group)
-        sidebar_layout.addStretch()
+        self.area_label = QLabel("Diện tích lỗi tối thiểu:")
+        self.min_area = QSpinBox()
+        self.min_area.setRange(0, 1000000)
+        self.min_area.setValue(30)
 
-        # CỘT PHẢI (KHÓA KÍCH THƯỚC CHỐNG PHÌNH TO)
-        display_layout = QHBoxLayout()
-        display_layout.setSpacing(14)
+        self.blur_label = QLabel("Độ mờ (blur_k - số lẻ):")
+        self.blur_k = QSpinBox()
+        self.blur_k.setRange(1, 99)
+        self.blur_k.setSingleStep(2)
+        self.blur_k.setValue(5)
 
-        orig_container = QVBoxLayout()
-        lbl_orig_title = QLabel("ẢNH / VIDEO GỐC")
-        lbl_orig_title.setAlignment(Qt.AlignCenter)
-        lbl_orig_title.setFixedHeight(24)
-        lbl_orig_title.setStyleSheet("font-weight: bold; color: #a6adc8;")
+        self.morph_label = QLabel("Độ lọc nhiễu (morph_k):")
+        self.morph_k = QSpinBox()
+        self.morph_k.setRange(1, 99)
+        self.morph_k.setValue(3)
 
-        self.lbl_orig_view = QLabel("Chưa tải dữ liệu")
-        self.lbl_orig_view.setObjectName("imageBox")
-        self.lbl_orig_view.setAlignment(Qt.AlignCenter)
-        self.lbl_orig_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.lbl_orig_view.setMinimumSize(320, 320)
+        # Đồng bộ tham số mỗi khi người dùng thay đổi giá trị
+        for spin in (self.low, self.high, self.threshold, self.min_area, self.blur_k, self.morph_k):
+            spin.valueChanged.connect(self._sync_params)
 
-        orig_container.addWidget(lbl_orig_title)
-        orig_container.addWidget(self.lbl_orig_view, stretch=1)
+        form.addRow(self.low_label, self.low)
+        form.addRow(self.high_label, self.high)
+        form.addRow(self.threshold_label, self.threshold)
+        form.addRow(self.area_label, self.min_area)
+        form.addRow(self.blur_label, self.blur_k)
+        form.addRow(self.morph_label, self.morph_k)
 
-        res_container = QVBoxLayout()
-        lbl_res_title = QLabel("KẾT QUẢ XỬ LÝ")
-        lbl_res_title.setAlignment(Qt.AlignCenter)
-        lbl_res_title.setFixedHeight(24)
-        lbl_res_title.setStyleSheet("font-weight: bold; color: #89b4fa;")
+        settings.addWidget(method_box, 1)
+        settings.addWidget(self.parameter_box, 2)
+        layout.addLayout(settings)
 
-        self.lbl_res_view = QLabel("Chưa có kết quả")
-        self.lbl_res_view.setObjectName("imageBox")
-        self.lbl_res_view.setAlignment(Qt.AlignCenter)
-        self.lbl_res_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.lbl_res_view.setMinimumSize(320, 320)
-
-        res_container.addWidget(lbl_res_title)
-        res_container.addWidget(self.lbl_res_view, stretch=1)
-
-        display_layout.addLayout(orig_container, stretch=1)
-        display_layout.addLayout(res_container, stretch=1)
-
-        main_layout.addWidget(sidebar)
-        main_layout.addLayout(display_layout, stretch=1)
-
-        self.on_algo_changed(0)
-
-    def on_algo_changed(self, index):
-        is_bbox = (index == 0)
-        is_contour = (index == 1)
-        is_edges = (index == 2)
-
-        self.spin_thresh.blockSignals(True)
-        self.spin_min_area.blockSignals(True)
-        if is_bbox:
-            self.spin_thresh.setValue(100)
-            self.spin_min_area.setValue(30)
-        elif is_contour:
-            self.spin_thresh.setValue(127)
-            self.spin_min_area.setValue(100)
-        self.spin_thresh.blockSignals(False)
-        self.spin_min_area.blockSignals(False)
-
-        self.lbl_thresh.setVisible(is_bbox or is_contour)
-        self.spin_thresh.setVisible(is_bbox or is_contour)
-        self.lbl_min_area.setVisible(is_bbox or is_contour)
-        self.spin_min_area.setVisible(is_bbox or is_contour)
-
-        self.chk_show_binary.setVisible(is_bbox)
-
-        self.lbl_blur_k.setVisible(is_contour)
-        self.spin_blur_k.setVisible(is_contour)
-        self.lbl_morph_k.setVisible(is_contour)
-        self.spin_morph_k.setVisible(is_contour)
-
-        self.lbl_low_thresh.setVisible(is_edges)
-        self.spin_low_thresh.setVisible(is_edges)
-        self.lbl_high_thresh.setVisible(is_edges)
-        self.spin_high_thresh.setVisible(is_edges)
-
-        self.trigger_update()
-
-    def on_odd_spin_changed(self, val):
-        if val % 2 == 0:
-            self.spin_blur_k.setValue(val + 1)
-            return
-        self.trigger_update()
-
-    def trigger_update(self):
-        if self.current_image is not None and not self.is_video_playing:
-            self.update_image_result()
-
-    def stop_video_if_running(self):
-        if self.timer.isActive():
-            self.timer.stop()
-        if self.video_cap is not None:
-            self.video_cap.release()
-            self.video_cap = None
-        self.is_video_playing = False
-        self.btn_pause_vid.setVisible(False)
-
-    def load_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn Ảnh", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)"
+        info_box = QGroupBox("Kết quả phân tích")
+        info_layout = QVBoxLayout(info_box)
+        info_layout.setContentsMargins(16, 24, 16, 16)
+        self.info = QLabel("Kết quả phân tích sẽ hiển thị tại đây.")
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet(
+            "QLabel { background: #F8FAFC; border: 1px solid #E2E8F0; "
+            "border-radius: 8px; padding: 14px; color: #334155; font-size: 14px; }"
         )
-        if not file_path:
-            return
+        info_layout.addWidget(self.info)
+        layout.addWidget(info_box)
 
-        self.stop_video_if_running()
-        img_array = np.fromfile(file_path, dtype=np.uint8)
-        self.current_image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        scroll.setWidget(content)
+        self.update_parameters()
+        return scroll
 
-        if self.current_image is not None:
-            self.display_cv_image(self.current_image, self.lbl_orig_view)
-            self.update_image_result()
+    def _sync_params(self):
+        bk = self.blur_k.value()
+        if bk % 2 == 0:
+            bk += 1
+        self._current_params = {
+            "method": self.method.currentText(),
+            "low": self.low.value(),
+            "high": self.high.value(),
+            "threshold": self.threshold.value(),
+            "min_area": self.min_area.value(),
+            "blur_k": bk,
+            "morph_k": self.morph_k.value(),
+        }
 
-    def load_video(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn Video", "", "Video Files (*.mp4 *.avi *.mkv *.mov)"
-        )
-        if not file_path:
-            return
+    def get_current_params(self):
+        return dict(self._current_params)
 
-        self.stop_video_if_running()
-        self.current_image = None
-        self.video_cap = cv2.VideoCapture(file_path)
+    def update_parameters(self):
+        method = self.method.currentText()
+        is_edge = method.startswith("Edge")
+        is_contour = (method == "Contour")
 
-        if self.video_cap.isOpened():
-            self.is_video_playing = True
-            self.btn_pause_vid.setVisible(True)
-            self.btn_pause_vid.setText("Tạm dừng Video")
-            self.timer.start(30)
+        self.low_label.setVisible(is_edge)
+        self.low.setVisible(is_edge)
+        self.high_label.setVisible(is_edge)
+        self.high.setVisible(is_edge)
 
-    def toggle_video(self):
-        if self.timer.isActive():
-            self.timer.stop()
-            self.btn_pause_vid.setText("Tiếp tục Video")
+        self.threshold_label.setVisible(not is_edge)
+        self.threshold.setVisible(not is_edge)
+        self.area_label.setVisible(not is_edge)
+        self.min_area.setVisible(not is_edge)
+
+        self.blur_label.setVisible(is_contour)
+        self.blur_k.setVisible(is_contour)
+        self.morph_label.setVisible(is_contour)
+        self.morph_k.setVisible(is_contour)
+
+        self._sync_params()
+
+    # ---- Quản lý luồng video và dọn file tạm ----
+
+    def stop_video_worker(self):
+        if self.video_worker is not None:
+            if self.video_worker.isRunning():
+                self.video_worker.stop()
+                self.video_worker.wait(3000)
+            self.video_worker = None
+        self._set_video_running_ui(False)
+
+    def cleanup_temp_video(self):
+        if self.video_result_path and os.path.exists(self.video_result_path):
+            try:
+                os.remove(self.video_result_path)
+            except OSError:
+                pass
+        self.video_result_path = None
+
+    def _set_video_running_ui(self, running):
+        if running:
+            self.process_btn.setText("⏹  Dừng video")
+            self.process_btn.setObjectName("dangerButton")
+            self.save_btn.setEnabled(False)
         else:
-            self.timer.start(30)
-            self.btn_pause_vid.setText("Tạm dừng Video")
+            self.process_btn.setText("▶  Chạy xử lý")
+            self.process_btn.setObjectName("primaryButton")
+            self.save_btn.setEnabled(True)
+        self.process_btn.style().unpolish(self.process_btn)
+        self.process_btn.style().polish(self.process_btn)
 
-    def apply_selected_algorithm(self, frame_bgr):
-        algo_idx = self.combo_algo.currentIndex()
+    # ---- Đọc/ghi ảnh hỗ trợ tên file Unicode (Windows hay gặp lỗi) ----
 
-        if algo_idx == 0:
-            t_val = self.spin_thresh.value()
-            min_a = self.spin_min_area.value()
-            result, info = detect_bounding_boxes(frame_bgr, threshold=t_val, min_area=min_a)
-            self.lbl_info.setText(f"Phát hiện: {info['boxes']} vùng nghi lỗi")
-            if self.chk_show_binary.isChecked():
-                return info["binary"]
-            return result
+    @staticmethod
+    def imread(path):
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+            if data.size == 0:
+                return None
+            return cv2.imdecode(data, cv2.IMREAD_COLOR)
+        except OSError:
+            return None
 
-        elif algo_idx == 1:
-            b_k = self.spin_blur_k.value()
-            t_val = self.spin_thresh.value()
-            m_k = self.spin_morph_k.value()
-            min_a = self.spin_min_area.value()
-            result, count = contour_detect(
-                frame_bgr, blur_k=b_k, thresh=t_val, morph_k=m_k, min_erea=min_a
+    @staticmethod
+    def imwrite(path, image):
+        ext = os.path.splitext(path)[1] or ".png"
+        ok, buf = cv2.imencode(ext, image)
+        if not ok:
+            return False
+        try:
+            buf.tofile(path)
+            return True
+        except OSError:
+            return False
+
+    # ---- Mở file ----
+
+    def open_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn ảnh", "", "Ảnh (*.jpg *.jpeg *.png *.bmp *.tif *.tiff)"
+        )
+        if not path:
+            return
+        self.stop_video_worker()
+        self.cleanup_temp_video()
+
+        image = self.imread(path)
+        if image is None:
+            QMessageBox.warning(self, "Lỗi", "Không thể đọc ảnh đã chọn.")
+            return
+        self.original_image = image
+        self.original_image_path = path
+        self.original_video = None
+        self.result = None
+        self.last_processed_suffix = None
+        self.original_box.show_pixmap(self.to_pixmap(image))
+        self.result_box.show_text("Chưa xử lý")
+        self.info.setText(
+            f"Ảnh: {os.path.basename(path)} | Kích thước: {image.shape[1]} x {image.shape[0]}"
+        )
+
+    def open_video(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn video", "", "Video (*.mp4 *.avi *.mov *.mkv)"
+        )
+        if not path:
+            return
+        self.stop_video_worker()
+        self.cleanup_temp_video()
+
+        cap = cv2.VideoCapture(path)
+        ok, frame = cap.read()
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        cap.release()
+        if not ok or frame is None:
+            QMessageBox.warning(self, "Lỗi", "Không thể đọc video đã chọn.")
+            return
+        self.original_video = path
+        self.original_image = None
+        self.original_image_path = None
+        self.result = None
+        self.last_processed_suffix = None
+        self.original_box.show_pixmap(self.to_pixmap(frame))
+        self.result_box.show_text("Video đã chọn - nhấn '▶ Chạy xử lý' để phát")
+        self.info.setText(
+            f"Video: {os.path.basename(path)} | Kích thước: {frame.shape[1]}x{frame.shape[0]} "
+            f"| FPS: {fps:.1f} | Tổng số khung hình: {total}"
+        )
+
+    # ---- Xử lý ----
+
+    def process_frame(self, frame):
+        self._sync_params()
+        params = self._current_params
+        method = params["method"]
+
+        if method.startswith("Edge"):
+            return edges(frame, params["low"], params["high"])
+
+        if method == "Contour":
+            return contour_detect(
+                frame,
+                blur_k=params["blur_k"],
+                thresh=params["threshold"],
+                morph_k=params["morph_k"],
+                min_erea=params["min_area"],
             )
-            self.lbl_info.setText(f"Số đường viền (Contours): {count}")
-            return result
 
-        elif algo_idx == 2:
-            low_t = self.spin_low_thresh.value()
-            high_t = self.spin_high_thresh.value()
-            result, edge_px = edges(frame_bgr, low_threshold=low_t, high_threshold=high_t)
-            self.lbl_info.setText(f"Số điểm ảnh biên (Edge Pixels): {edge_px:,}")
-            return result
+        return detect_bounding_boxes(
+            frame, params["threshold"], params["min_area"]
+        )
 
-    def update_image_result(self):
-        if self.current_image is not None:
-            res = self.apply_selected_algorithm(self.current_image)
-            self.last_result_image = res
-            self.display_cv_image(res, self.lbl_res_view)
+    def run_detection(self):
+        # Nếu video đang phát mà bấm nút thì dừng video
+        if self.video_worker is not None and self.video_worker.isRunning():
+            self.stop_video_worker()
+            return
 
-    def process_video_frame(self):
-        if self.video_cap is not None and self.video_cap.isOpened():
-            ret, frame = self.video_cap.read()
-            if not ret:
-                self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if self.original_image is None and self.original_video is None:
+            QMessageBox.warning(self, "Thông báo", "Vui lòng mở ảnh hoặc video trước.")
+            return
+
+        if self.original_image is not None:
+            try:
+                result, stats = self.process_frame(self.original_image)
+                self.result = result
+                self.last_processed_suffix = self.technique_suffix()
+                self.result_box.show_pixmap(self.to_pixmap(result))
+                self.info.setText(self.format_stats(stats))
+            except Exception as e:
+                QMessageBox.critical(self, "Lỗi xử lý", f"Không thể xử lý dữ liệu:\n{e}")
+            return
+
+        self.start_video_processing()
+
+    def start_video_processing(self):
+        self.stop_video_worker()
+        self.cleanup_temp_video()
+        self._sync_params()
+        self.last_processed_suffix = self.technique_suffix()
+        self._set_video_running_ui(True)
+        self.info.setText("Đang khởi chạy xử lý video...")
+
+        self.video_worker = VideoWorker(self.original_video, self.get_current_params)
+        self.video_worker.frame_ready.connect(self.on_video_frame)
+        self.video_worker.finished_ok.connect(self.on_video_finished)
+        self.video_worker.failed.connect(self.on_video_failed)
+        self.video_worker.finished.connect(self.on_video_thread_done)
+        self.video_worker.start()
+
+    def on_video_frame(self, orig_frame, result_frame, stats, frame_idx, total_frames):
+        self.result = result_frame
+        self.original_box.show_pixmap(self.to_pixmap(orig_frame))
+        self.result_box.show_pixmap(self.to_pixmap(result_frame))
+        progress = f"{frame_idx}/{total_frames}" if total_frames > 0 else f"{frame_idx}"
+        self.info.setText(f"Đang phát video (Khung hình {progress}) | {self.format_stats(stats)}")
+
+    def on_video_finished(self, output_path, last_frame, last_stats, frame_count):
+        self.cleanup_temp_video()
+        self.video_result_path = output_path
+        self.result = last_frame
+        if last_frame is not None:
+            self.result_box.show_pixmap(self.to_pixmap(last_frame))
+        stats_text = self.format_stats(last_stats) if last_stats is not None else ""
+        self.info.setText(
+            f"Đã phát và xử lý xong {frame_count} khung hình. {stats_text} "
+            "| Bấm 'Lưu kết quả' để lưu video hoặc 'Chạy xử lý' để phát lại."
+        )
+
+    def on_video_failed(self, msg):
+        QMessageBox.critical(self, "Lỗi xử lý", f"Không thể xử lý video:\n{msg}")
+        self.info.setText("Xử lý video thất bại.")
+
+    def on_video_thread_done(self):
+        self._set_video_running_ui(False)
+        self.video_worker = None
+
+    def format_stats(self, stats):
+        if isinstance(stats, int):
+            return f"Kỹ thuật: Contour | Số vùng/đường bao đạt điều kiện: {stats}"
+        if isinstance(stats, dict):
+            if "edge_pixels" in stats:
+                return f"Kỹ thuật: Canny Edge | Số điểm ảnh biên phát hiện được: {stats['edge_pixels']:,}"
+            if "boxes" in stats:
+                return f"Kỹ thuật: Bounding Box | Số khung lỗi phát hiện được: {stats['boxes']}"
+        return f"Kết quả: {stats}"
+
+    # ---- Lưu kết quả (tự đặt tên: tenanh_tenkythuat) ----
+
+    def technique_suffix(self):
+        method = self.method.currentText()
+        if method.startswith("Edge"):
+            return "canny"
+        if method == "Contour":
+            return "contour"
+        return "bbox"
+
+    @staticmethod
+    def unique_path(path):
+        if not os.path.exists(path):
+            return path
+        stem, ext = os.path.splitext(path)
+        i = 1
+        while os.path.exists(f"{stem}_{i}{ext}"):
+            i += 1
+        return f"{stem}_{i}{ext}"
+
+    def save_result(self):
+        suffix = getattr(self, "last_processed_suffix", None) or self.technique_suffix()
+
+        # Lưu Video
+        if self.video_result_path and os.path.exists(self.video_result_path):
+            src = self.original_video
+            if src and os.path.exists(src):
+                stem = os.path.splitext(os.path.basename(src))[0]
+                folder = os.path.dirname(os.path.abspath(src))
+            else:
+                stem = "video_ket_qua"
+                folder = os.getcwd()
+
+            default_path = os.path.join(folder, f"{stem}_{suffix}.mp4")
+            out, _ = QFileDialog.getSaveFileName(
+                self,
+                "Chọn nơi lưu video kết quả",
+                default_path,
+                "Video MP4 (*.mp4);;Tất cả tệp (*.*)"
+            )
+            if not out:
                 return
+            if not out.lower().endswith(".mp4"):
+                out += ".mp4"
 
-            self.current_image = frame
-            self.display_cv_image(frame, self.lbl_orig_view)
-            res = self.apply_selected_algorithm(frame)
-            self.last_result_image = res
-            self.display_cv_image(res, self.lbl_res_view)
-
-    def display_cv_image(self, img, label_widget):
-        if img is None:
+            try:
+                shutil.copy2(self.video_result_path, out)
+            except OSError as e:
+                QMessageBox.critical(self, "Lỗi", f"Không thể lưu video:\n{e}")
+                return
+            QMessageBox.information(self, "Lưu kết quả", f"Đã lưu video tại:\n{out}")
             return
 
-        if img.ndim == 2:
-            h, w = img.shape
-            q_img = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
+        # Lưu Ảnh
+        if self.result is None:
+            QMessageBox.warning(self, "Thông báo", "Chưa có kết quả để lưu.")
+            return
+
+        src = self.original_image_path
+        if src and os.path.exists(src):
+            stem = os.path.splitext(os.path.basename(src))[0]
+            folder = os.path.dirname(os.path.abspath(src))
         else:
-            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_img.shape
-            bytes_per_line = ch * w
-            q_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            stem = "ket_qua"
+            folder = os.getcwd()
 
-        target_size = label_widget.contentsRect().size()
-        if target_size.width() > 10 and target_size.height() > 10:
-            pixmap = QPixmap.fromImage(q_img)
-            scaled_pixmap = pixmap.scaled(
-                target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            label_widget.setPixmap(scaled_pixmap)
+        default_path = os.path.join(folder, f"{stem}_{suffix}.png")
+        out, _ = QFileDialog.getSaveFileName(
+            self,
+            "Chọn nơi lưu ảnh kết quả",
+            default_path,
+            "Ảnh PNG (*.png);;Ảnh JPEG (*.jpg *.jpeg);;Ảnh BMP (*.bmp);;Ảnh TIFF (*.tif *.tiff)"
+        )
+        if not out:
+            return
+        if not os.path.splitext(out)[1]:
+            out += ".png"
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self.current_image is not None and not self.timer.isActive():
-            self.display_cv_image(self.current_image, self.lbl_orig_view)
-            if self.last_result_image is not None:
-                self.display_cv_image(self.last_result_image, self.lbl_res_view)
+        if not self.imwrite(out, self.result):
+            QMessageBox.critical(self, "Lỗi", "Không thể lưu ảnh kết quả.")
+            return
+        QMessageBox.information(self, "Lưu kết quả", f"Đã lưu ảnh tại:\n{out}")
+
+    # ---- Hiển thị ----
+
+    @staticmethod
+    def to_pixmap(image):
+        if image.ndim == 2:
+            gray = np.ascontiguousarray(image)
+            h, w = gray.shape
+            qimage = QImage(
+                gray.data, w, h, gray.strides[0], QImage.Format_Grayscale8
+            ).copy()
+        else:
+            rgb = np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            h, w, _ = rgb.shape
+            qimage = QImage(
+                rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888
+            ).copy()
+        return QPixmap.fromImage(qimage)
+
+    def closeEvent(self, event):
+        self.stop_video_worker()
+        self.cleanup_temp_video()
+        event.accept()
